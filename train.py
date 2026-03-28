@@ -15,7 +15,7 @@ from models.retinaface import RetinaFace
 
 parser = argparse.ArgumentParser(description='Retinaface Training')
 parser.add_argument('--training_dataset', default='D:\\widerface\\train\\label.txt', help='Training dataset directory')
-parser.add_argument('--network', default='resnest50', help='Backbone network mobile0.25, resnet50, resnest50, resnet50_p2 or resnest50_p2')
+parser.add_argument('--network', default='resnest50_p2', help='Backbone network mobile0.25, resnet50, resnest50, resnet50_p2 or resnest50_p2')
 parser.add_argument('--num_workers', default=4, type=int, help='Number of workers used in dataloading')
 parser.add_argument('--lr', '--learning-rate', default=1e-3, type=float, help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
@@ -94,8 +94,16 @@ with torch.no_grad():
     priors = priorbox.forward()
     priors = priors.cuda()
 
+
+def set_batchnorm_eval(module):
+    # ResNeSt contains BatchNorm layers in attention branches that are unstable with batch_size=1.
+    if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+        module.eval()
+
 def train():
     net.train()
+    if batch_size == 1:
+        net.apply(set_batchnorm_eval)
     epoch = 0 + args.resume_epoch
     print('Loading Dataset...')
 
@@ -115,7 +123,7 @@ def train():
     for iteration in range(start_iter, max_iter):
         if iteration % epoch_size == 0:
             # create batch iterator
-            batch_iterator = iter(data.DataLoader(dataset, batch_size, shuffle=True, num_workers=num_workers, collate_fn=detection_collate))
+            batch_iterator = iter(data.DataLoader(dataset, batch_size, shuffle=True, num_workers=num_workers, collate_fn=detection_collate, drop_last=True))
             if (epoch % 10 == 0 and epoch > 0) or (epoch % 5 == 0 and epoch > cfg['decay1']):
                 torch.save(net.state_dict(), save_folder + cfg['name']+ '_epoch_' + str(epoch) + '.pth')
             epoch += 1

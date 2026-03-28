@@ -55,7 +55,8 @@ class RetinaFace(nn.Module):
         super(RetinaFace,self).__init__()
         self.phase = phase
         backbone = None
-        if cfg['name'] == 'mobilenet0.25':
+        backbone_name = cfg.get('backbone', cfg['name'])
+        if backbone_name == 'mobilenet0.25':
             backbone = MobileNetV1()
             if cfg['pretrain']:
                 checkpoint = torch.load("./weights/mobilenetV1X0.25_pretrain.tar", map_location=torch.device('cpu'))
@@ -66,11 +67,13 @@ class RetinaFace(nn.Module):
                     new_state_dict[name] = v
                 # load params
                 backbone.load_state_dict(new_state_dict)
-        elif cfg['name'] == 'Resnet50':
+        elif backbone_name == 'resnet50':
             import torchvision.models as models
             backbone = models.resnet50(pretrained=cfg['pretrain'])
-        elif cfg['name'] == 'ResNeSt50':
+        elif backbone_name == 'resnest50':
             backbone = build_resnest50(pretrained=cfg['pretrain'])
+        else:
+            raise ValueError('Unsupported backbone: {}'.format(backbone_name))
 
         self.body = _utils.IntermediateLayerGetter(backbone, cfg['return_layers'])
         in_channels_list = cfg['in_channels_list']
