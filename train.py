@@ -14,8 +14,8 @@ import math
 from models.retinaface import RetinaFace
 
 parser = argparse.ArgumentParser(description='Retinaface Training')
-parser.add_argument('--training_dataset', default='D:\\widerface\\train\\label.txt', help='Training dataset directory')
-parser.add_argument('--network', default='resnest50_p2', help='Backbone network mobile0.25, resnet50, resnest50, resnet50_p2 or resnest50_p2')
+parser.add_argument('--training_dataset', default='D:\\cut\\retinaface_dataset\\train\\label.txt', help='Training dataset directory')
+parser.add_argument('--network', default='resnest50', help='Backbone network mobile0.25, resnet50, resnest50, resnet50_p2 or resnest50_p2')
 parser.add_argument('--num_workers', default=4, type=int, help='Number of workers used in dataloading')
 parser.add_argument('--lr', '--learning-rate', default=1e-3, type=float, help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
@@ -87,7 +87,8 @@ cudnn.benchmark = True
 
 
 optimizer = optim.SGD(net.parameters(), lr=initial_lr, momentum=momentum, weight_decay=weight_decay)
-criterion = MultiBoxLoss(num_classes, 0.35, True, 0, True, 7, 0.35, False)
+# 训练阶段开启 ATSS 匹配，同时分类/回归损失分别替换为 Focal Loss 和 CIoU Loss。
+criterion = MultiBoxLoss(num_classes, 0.35, True, 0, True, 7, 0.35, False, cfg=cfg, use_atss=True)
 
 priorbox = PriorBox(cfg, image_size=(img_dim, img_dim))
 with torch.no_grad():

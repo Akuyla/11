@@ -93,7 +93,53 @@ def matrix_iof(a, b):
     return area_i / np.maximum(area_a[:, np.newaxis], 1)
 
 
-def match(threshold, truths, priors, variances, labels, landms, loc_t, conf_t, landm_t, idx):
+def box_centers(boxes):
+    return torch.cat(((boxes[:, :2] + boxes[:, 2:]) / 2, boxes[:, 2:] - boxes[:, :2]), 1)
+
+
+def bbox_overlaps_ciou(boxes1, boxes2, eps=1e-7):
+    # CIoU 计算：在 IoU 基础上同时考虑中心点距离和长宽比一致性。
+    lt = torch.max(boxes1[:, :2], boxes2[:, :2])
+    rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, 0] * wh[:, 1]
+
+    area1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=0) * (boxes1[:, 3] - boxes1[:, 1]).clamp(min=0)
+    area2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=0) * (boxes2[:, 3] - boxes2[:, 1]).clamp(min=0)
+    union = area1 + area2 - inter + eps
+    iou = inter / union
+
+    centers1 = (boxes1[:, :2] + boxes1[:, 2:]) / 2
+    centers2 = (boxes2[:, :2] + boxes2[:, 2:]) / 2
+    center_dist = ((centers1 - centers2) ** 2).sum(dim=1)
+
+    enclose_lt = torch.min(boxes1[:, :2], boxes2[:, :2])
+    enclose_rb = torch.max(boxes1[:, 2:], boxes2[:, 2:])
+    enclose_wh = (enclose_rb - enclose_lt).clamp(min=0)
+    c2 = (enclose_wh[:, 0] ** 2 + enclose_wh[:, 1] ** 2).clamp(min=eps)
+
+    w1 = (boxes1[:, 2] - boxes1[:, 0]).clamp(min=eps)
+    h1 = (boxes1[:, 3] - boxes1[:, 1]).clamp(min=eps)
+    w2 = (boxes2[:, 2] - boxes2[:, 0]).clamp(min=eps)
+    h2 = (boxes2[:, 3] - boxes2[:, 1]).clamp(min=eps)
+
+    v = (4 / (np.pi ** 2)) * torch.pow(torch.atan(w1 / h1) - torch.atan(w2 / h2), 2)
+    with torch.no_grad():
+        alpha = v / (1 - iou + v + eps)
+    return iou - (center_dist / c2 + alpha * v)
+
+
+def ciou_loss(boxes1, boxes2, reduction='sum'):
+    # 将 CIoU 转成损失形式，供边框回归分支直接优化。
+    loss = 1 - bbox_overlaps_ciou(boxes1, boxes2)
+    if reduction == 'mean':
+        return loss.mean()
+    if reduction == 'sum':
+        return loss.sum()
+    return loss
+
+
+def match(threshold, truths, priors, variances, labels, landms, loc_t, conf_t, landm_t, bbox_t, idx):
     """Match each prior box with the ground truth box of the highest jaccard
     overlap, encode the bounding boxes, then return the matched indices
     corresponding to both confidence and location preds.
@@ -108,6 +154,7 @@ def match(threshold, truths, priors, variances, labels, landms, loc_t, conf_t, l
         loc_t: (tensor) Tensor to be filled w/ endcoded location targets.
         conf_t: (tensor) Tensor to be filled w/ matched indices for conf preds.
         landm_t: (tensor) Tensor to be filled w/ endcoded landm targets.
+        bbox_t: (tensor) Tensor to be filled w/ matched gt boxes.
         idx: (int) current batch index
     Return:
         The matched indices corresponding to 1)location 2)confidence 3)landm preds.
@@ -151,6 +198,92 @@ def match(threshold, truths, priors, variances, labels, landms, loc_t, conf_t, l
     loc_t[idx] = loc    # [num_priors,4] encoded offsets to learn
     conf_t[idx] = conf  # [num_priors] top class label for each prior
     landm_t[idx] = landm
+    # 额外保存原始 GT 框，便于后续使用 CIoU 在解码后的预测框上计算回归损失。
+    bbox_t[idx] = matches
+
+
+def atss_match(priors, truths, labels, landms, variances, num_priors_per_level, loc_t, conf_t, landm_t, bbox_t, idx, topk=9):
+    # ATSS：按金字塔层分别选取距离 GT 中心最近的候选 anchor，再用动态阈值划分正负样本。
+    num_priors = priors.size(0)
+    device = priors.device
+    conf = priors.new_zeros(num_priors, dtype=torch.long)
+    loc = priors.new_zeros(num_priors, 4)
+    landm = priors.new_zeros(num_priors, 10)
+    bbox = priors.new_zeros(num_priors, 4)
+
+    if truths.numel() == 0:
+        loc_t[idx] = loc
+        conf_t[idx] = conf
+        landm_t[idx] = landm
+        bbox_t[idx] = bbox
+        return
+
+    prior_boxes = point_form(priors)
+    overlaps = jaccard(truths, prior_boxes)
+    prior_centers = priors[:, :2]
+    gt_centers = (truths[:, :2] + truths[:, 2:]) / 2
+
+    candidate_idxs = []
+    start = 0
+    for num_level_priors in num_priors_per_level:
+        end = start + num_level_priors
+        level_centers = prior_centers[start:end]
+        # 每个特征层分别选 top-k 最近中心点的 anchor，避免正样本只集中在单一层级。
+        distances = torch.cdist(gt_centers, level_centers, p=2)
+        k = min(topk, num_level_priors)
+        _, topk_idxs = distances.topk(k, dim=1, largest=False)
+        candidate_idxs.append(topk_idxs + start)
+        start = end
+
+    candidate_idxs = torch.cat(candidate_idxs, dim=1)
+    candidate_overlaps = overlaps.gather(1, candidate_idxs)
+    overlaps_mean = candidate_overlaps.mean(dim=1, keepdim=True)
+    overlaps_std = candidate_overlaps.std(dim=1, keepdim=True)
+    # 动态阈值：mean + std，是 ATSS 的核心思想。
+    overlaps_thr = overlaps_mean + overlaps_std
+
+    is_pos = candidate_overlaps >= overlaps_thr
+    positive_mask = overlaps.new_zeros((truths.size(0), num_priors), dtype=torch.bool)
+
+    for gt_idx in range(truths.size(0)):
+        candidate = candidate_idxs[gt_idx][is_pos[gt_idx]]
+        if candidate.numel() == 0:
+            # 如果该 GT 没有通过动态阈值的候选，则回退到 IoU 最大的 anchor。
+            candidate = overlaps[gt_idx].argmax().view(1)
+
+        gt = truths[gt_idx]
+        centers = prior_centers[candidate]
+        inside_gt = (
+            (centers[:, 0] >= gt[0]) &
+            (centers[:, 0] <= gt[2]) &
+            (centers[:, 1] >= gt[1]) &
+            (centers[:, 1] <= gt[3])
+        )
+        candidate = candidate[inside_gt]
+        if candidate.numel() == 0:
+            # 如果候选中心点都不落在 GT 内部，同样回退到 IoU 最大的 anchor。
+            candidate = overlaps[gt_idx].argmax().view(1)
+        positive_mask[gt_idx, candidate] = True
+
+    matched_overlaps = overlaps.new_full((truths.size(0), num_priors), -1)
+    matched_overlaps[positive_mask] = overlaps[positive_mask]
+    best_gt_overlaps, best_gt_idx = matched_overlaps.max(dim=0)
+    positive_priors = best_gt_overlaps >= 0
+
+    if positive_priors.any():
+        matched_gt = best_gt_idx[positive_priors]
+        matches = truths[matched_gt]
+        bbox[positive_priors] = matches
+        # 位置监督仍然保存为编码形式，便于与现有解码流程兼容。
+        loc[positive_priors] = encode(matches, priors[positive_priors], variances)
+        matched_landm = landms[matched_gt]
+        landm[positive_priors] = encode_landm(matched_landm, priors[positive_priors], variances)
+        conf[positive_priors] = labels[matched_gt].long()
+
+    loc_t[idx] = loc
+    conf_t[idx] = conf
+    landm_t[idx] = landm
+    bbox_t[idx] = bbox
 
 
 def encode(matched, priors, variances):
@@ -326,5 +459,3 @@ def nms(boxes, scores, overlap=0.5, top_k=200):
         # keep only elements with an IoU <= overlap
         idx = idx[IoU.le(overlap)]
     return keep, count
-
-

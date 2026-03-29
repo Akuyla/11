@@ -2,9 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-from utils.box_utils import match, log_sum_exp
-from data import cfg_mnet
-GPU = cfg_mnet['gpu_train']
+from math import ceil
+from utils.box_utils import atss_match, ciou_loss, decode, match
 
 class MultiBoxLoss(nn.Module):
     """SSD Weighted Loss Function
@@ -29,7 +28,7 @@ class MultiBoxLoss(nn.Module):
         See: https://arxiv.org/pdf/1512.02325.pdf for more details.
     """
 
-    def __init__(self, num_classes, overlap_thresh, prior_for_matching, bkg_label, neg_mining, neg_pos, neg_overlap, encode_target):
+    def __init__(self, num_classes, overlap_thresh, prior_for_matching, bkg_label, neg_mining, neg_pos, neg_overlap, encode_target, cfg=None, use_atss=True, atss_topk=9, focal_alpha=0.25, focal_gamma=2.0):
         super(MultiBoxLoss, self).__init__()
         self.num_classes = num_classes
         self.threshold = overlap_thresh
@@ -40,6 +39,35 @@ class MultiBoxLoss(nn.Module):
         self.negpos_ratio = neg_pos
         self.neg_overlap = neg_overlap
         self.variance = [0.1, 0.2]
+        self.cfg = cfg
+        self.use_atss = use_atss
+        self.atss_topk = atss_topk
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+        self.num_priors_per_level = None
+        if cfg is not None:
+            # 根据当前输入尺寸和每层 anchor 设置，预先计算各层 prior 数量，供 ATSS 分层采样使用。
+            self.num_priors_per_level = self._build_num_priors_per_level(cfg)
+
+    def _build_num_priors_per_level(self, cfg):
+        image_size = cfg['image_size']
+        priors_per_level = []
+        for step, min_sizes in zip(cfg['steps'], cfg['min_sizes']):
+            feature_h = ceil(image_size / step)
+            feature_w = ceil(image_size / step)
+            priors_per_level.append(feature_h * feature_w * len(min_sizes))
+        return priors_per_level
+
+    def focal_loss(self, conf_data, conf_t):
+        # Focal Loss：降低大量易分类负样本对分类分支的主导作用。
+        conf_flat = conf_data.view(-1, self.num_classes)
+        target_flat = conf_t.view(-1)
+        ce_loss = F.cross_entropy(conf_flat, target_flat, reduction='none')
+        prob = F.softmax(conf_flat, dim=1)
+        pt = prob[torch.arange(prob.size(0), device=prob.device), target_flat]
+        alpha_t = torch.where(target_flat > 0, torch.full_like(pt, self.focal_alpha), torch.full_like(pt, 1 - self.focal_alpha))
+        loss = alpha_t * torch.pow(1 - pt, self.focal_gamma) * ce_loss
+        return loss.sum()
 
     def forward(self, predictions, priors, targets):
         """Multibox Loss
@@ -56,25 +84,27 @@ class MultiBoxLoss(nn.Module):
 
         loc_data, conf_data, landm_data = predictions
         priors = priors
+        device = loc_data.device
         num = loc_data.size(0)
         num_priors = (priors.size(0))
 
         # match priors (default boxes) and ground truth boxes
-        loc_t = torch.Tensor(num, num_priors, 4)
-        landm_t = torch.Tensor(num, num_priors, 10)
-        conf_t = torch.LongTensor(num, num_priors)
+        loc_t = torch.zeros(num, num_priors, 4, device=device)
+        landm_t = torch.zeros(num, num_priors, 10, device=device)
+        bbox_t = torch.zeros(num, num_priors, 4, device=device)
+        conf_t = torch.zeros(num, num_priors, dtype=torch.long, device=device)
         for idx in range(num):
             truths = targets[idx][:, :4].data
             labels = targets[idx][:, -1].data
             landms = targets[idx][:, 4:14].data
             defaults = priors.data
-            match(self.threshold, truths, defaults, self.variance, labels, landms, loc_t, conf_t, landm_t, idx)
-        if GPU:
-            loc_t = loc_t.cuda()
-            conf_t = conf_t.cuda()
-            landm_t = landm_t.cuda()
+            if self.use_atss and self.num_priors_per_level is not None:
+                # 使用 ATSS 替换原始 IoU 阈值匹配。
+                atss_match(defaults, truths, labels, landms, self.variance, self.num_priors_per_level, loc_t, conf_t, landm_t, bbox_t, idx, topk=self.atss_topk)
+            else:
+                match(self.threshold, truths, defaults, self.variance, labels, landms, loc_t, conf_t, landm_t, bbox_t, idx)
 
-        zeros = torch.tensor(0).cuda()
+        zeros = torch.tensor(0, device=device)
         # landm Loss (Smooth L1)
         # Shape: [batch,num_priors,10]
         pos1 = conf_t > zeros
@@ -87,34 +117,26 @@ class MultiBoxLoss(nn.Module):
 
 
         pos = conf_t != zeros
-        conf_t[pos] = 1
+        conf_target = conf_t.clone()
+        # RetinaFace 当前是单类别检测，正样本统一映射到前景类别 1。
+        conf_target[pos] = 1
 
-        # Localization Loss (Smooth L1)
+        # Localization Loss (CIoU)
         # Shape: [batch,num_priors,4]
+        num_pos = pos.long().sum(1, keepdim=True)
         pos_idx = pos.unsqueeze(pos.dim()).expand_as(loc_data)
         loc_p = loc_data[pos_idx].view(-1, 4)
-        loc_t = loc_t[pos_idx].view(-1, 4)
-        loss_l = F.smooth_l1_loss(loc_p, loc_t, reduction='sum')
+        matched_priors = priors.unsqueeze(0).expand(num, num_priors, 4)[pos_idx].view(-1, 4)
+        matched_boxes = bbox_t[pos_idx].view(-1, 4)
+        if loc_p.numel() == 0:
+            loss_l = loc_data.sum() * 0
+        else:
+            # 先将预测偏移量解码回真实框，再与 GT 框计算 CIoU 损失。
+            decoded_boxes = decode(loc_p, matched_priors, self.variance)
+            loss_l = ciou_loss(decoded_boxes, matched_boxes, reduction='sum')
 
-        # Compute max conf across batch for hard negative mining
-        batch_conf = conf_data.view(-1, self.num_classes)
-        loss_c = log_sum_exp(batch_conf) - batch_conf.gather(1, conf_t.view(-1, 1))
-
-        # Hard Negative Mining
-        loss_c[pos.view(-1, 1)] = 0 # filter out pos boxes for now
-        loss_c = loss_c.view(num, -1)
-        _, loss_idx = loss_c.sort(1, descending=True)
-        _, idx_rank = loss_idx.sort(1)
-        num_pos = pos.long().sum(1, keepdim=True)
-        num_neg = torch.clamp(self.negpos_ratio*num_pos, max=pos.size(1)-1)
-        neg = idx_rank < num_neg.expand_as(idx_rank)
-
-        # Confidence Loss Including Positive and Negative Examples
-        pos_idx = pos.unsqueeze(2).expand_as(conf_data)
-        neg_idx = neg.unsqueeze(2).expand_as(conf_data)
-        conf_p = conf_data[(pos_idx+neg_idx).gt(0)].view(-1,self.num_classes)
-        targets_weighted = conf_t[(pos+neg).gt(0)]
-        loss_c = F.cross_entropy(conf_p, targets_weighted, reduction='sum')
+        # Confidence Loss (Focal Loss)
+        loss_c = self.focal_loss(conf_data, conf_target)
 
         # Sum of losses: L(x,c,l,g) = (Lconf(x, c) + αLloc(x,l,g)) / N
         N = max(num_pos.data.sum().float(), 1)
