@@ -36,3 +36,55 @@ def py_cpu_nms(dets, thresh):
         order = order[inds + 1]
 
     return keep
+
+
+def py_cpu_soft_nms(dets, thresh, sigma=0.5, score_thresh=0.001, method='linear'):
+    """Pure Python Soft-NMS baseline."""
+    if dets.shape[0] == 0:
+        return []
+
+    dets = dets.copy()
+    scores = dets[:, 4]
+    indexes = np.arange(dets.shape[0])
+    keep = []
+
+    while dets.shape[0] > 0:
+        max_idx = np.argmax(scores)
+        dets[[0, max_idx]] = dets[[max_idx, 0]]
+        scores[[0, max_idx]] = scores[[max_idx, 0]]
+        indexes[[0, max_idx]] = indexes[[max_idx, 0]]
+
+        keep.append(indexes[0])
+        if dets.shape[0] == 1:
+            break
+
+        x1 = np.maximum(dets[0, 0], dets[1:, 0])
+        y1 = np.maximum(dets[0, 1], dets[1:, 1])
+        x2 = np.minimum(dets[0, 2], dets[1:, 2])
+        y2 = np.minimum(dets[0, 3], dets[1:, 3])
+
+        w = np.maximum(0.0, x2 - x1 + 1)
+        h = np.maximum(0.0, y2 - y1 + 1)
+        inter = w * h
+
+        area0 = (dets[0, 2] - dets[0, 0] + 1) * (dets[0, 3] - dets[0, 1] + 1)
+        area1 = (dets[1:, 2] - dets[1:, 0] + 1) * (dets[1:, 3] - dets[1:, 1] + 1)
+        iou = inter / (area0 + area1 - inter)
+
+        if method == 'linear':
+            weight = np.ones_like(iou)
+            weight[iou > thresh] -= iou[iou > thresh]
+        elif method == 'gaussian':
+            weight = np.exp(-(iou * iou) / sigma)
+        else:
+            weight = np.ones_like(iou)
+            weight[iou > thresh] = 0.0
+
+        scores[1:] = scores[1:] * weight
+        keep_mask = scores[1:] > score_thresh
+
+        dets = dets[1:][keep_mask]
+        scores = scores[1:][keep_mask]
+        indexes = indexes[1:][keep_mask]
+
+    return keep

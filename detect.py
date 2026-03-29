@@ -6,7 +6,7 @@ import torch.backends.cudnn as cudnn
 import numpy as np
 from data import cfg_mnet, cfg_re50, cfg_resnest50, cfg_re50_p2, cfg_resnest50_p2, cfg_re50_p2_se, cfg_resnest50_p2_se
 from layers.functions.prior_box import PriorBox
-from utils.nms.py_cpu_nms import py_cpu_nms
+from utils.nms.py_cpu_nms import py_cpu_nms, py_cpu_soft_nms
 import cv2
 from models.retinaface import RetinaFace
 from utils.box_utils import decode, decode_landm
@@ -141,9 +141,12 @@ if __name__ == '__main__':
         landms = landms[order]
         scores = scores[order]
 
-        # do NMS
+        # 根据配置选择传统 NMS 或 Soft-NMS，便于做后处理阶段的独立消融。
         dets = np.hstack((boxes, scores[:, np.newaxis])).astype(np.float32, copy=False)
-        keep = py_cpu_nms(dets, args.nms_threshold)
+        if cfg.get('use_soft_nms', False):
+            keep = py_cpu_soft_nms(dets, args.nms_threshold)
+        else:
+            keep = py_cpu_nms(dets, args.nms_threshold)
         # keep = nms(dets, args.nms_threshold,force_cpu=args.cpu)
         dets = dets[keep, :]
         landms = landms[keep]
