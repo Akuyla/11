@@ -37,6 +37,24 @@ def conv_dw(inp, oup, stride, leaky=0.1):
         nn.LeakyReLU(negative_slope= leaky,inplace=True),
     )
 
+class SEModule(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(SEModule, self).__init__()
+        reduced_channels = max(channels // reduction, 8)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, reduced_channels, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(reduced_channels, channels, kernel_size=1, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # SE 模块：对通道维进行重标定，突出更有判别力的响应。
+        scale = self.avg_pool(x)
+        scale = self.fc(scale)
+        return x * scale
+
 class SSH(nn.Module):
     def __init__(self, in_channel, out_channel):
         super(SSH, self).__init__()
@@ -65,6 +83,27 @@ class SSH(nn.Module):
         out = F.relu(out)
         return out
 
+
+class SSHSE(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super(SSHSE, self).__init__()
+        self.ssh = SSH(in_channel, out_channel)
+        self.se = SEModule(out_channel)
+
+    def forward(self, input):
+        # 先提取 SSH 多分支上下文，再使用 SE 做通道注意力增强。
+        out = self.ssh(input)
+        out = self.se(out)
+        return out
+
+
+def build_ssh(ssh_type, in_channel, out_channel):
+    if ssh_type == 'ssh':
+        return SSH(in_channel, out_channel)
+    if ssh_type == 'ssh_se':
+        return SSHSE(in_channel, out_channel)
+    raise ValueError('Unsupported ssh_type: {}'.format(ssh_type))
+
 class FPN(nn.Module):
     def __init__(self,in_channels_list,out_channels):
         super(FPN,self).__init__()
@@ -87,7 +126,7 @@ class FPN(nn.Module):
         # names = list(input.keys())
         input = list(input.values())
 
-        # Support both the original 3-level pyramid and the P2-P5 4-level pyramid.
+        # 同时兼容原始的 3 层金字塔与加入 P2 后的 4 层金字塔。
         outputs = [conv(feature) for conv, feature in zip(self.output_convs, input)]
 
         for idx in range(len(outputs) - 1, 0, -1):
@@ -95,7 +134,7 @@ class FPN(nn.Module):
             outputs[idx - 1] = outputs[idx - 1] + upsample
             outputs[idx - 1] = self.merge_convs[idx - 1](outputs[idx - 1])
 
-        # Add one extra conv on P2 to strengthen the smallest-face feature map.
+        # 在 P2 上额外增加一层卷积，进一步增强最小人脸对应的特征表达。
         if self.use_p2:
             outputs[0] = self.p2_refine(outputs[0])
 

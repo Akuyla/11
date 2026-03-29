@@ -7,7 +7,7 @@ from collections import OrderedDict
 
 from models.net import MobileNetV1 as MobileNetV1
 from models.net import FPN as FPN
-from models.net import SSH as SSH
+from models.net import build_ssh
 from models.resnest import build_resnest50
 
 
@@ -66,10 +66,10 @@ class RetinaFace(nn.Module):
                     new_state_dict[name] = v
                 # load params
                 backbone.load_state_dict(new_state_dict)
-        elif cfg['name'] in ['Resnet50', 'Resnet50_P2']:
+        elif cfg['name'] in ['Resnet50', 'Resnet50_P2', 'Resnet50_P2_SE']:
             import torchvision.models as models
             backbone = models.resnet50(pretrained=cfg['pretrain'])
-        elif cfg['name'] in ['ResNeSt50', 'ResNeSt50_P2']:
+        elif cfg['name'] in ['ResNeSt50', 'ResNeSt50_P2', 'ResNeSt50_P2_SE']:
             backbone = build_resnest50(pretrained=cfg['pretrain'])
         else:
             raise ValueError('Unsupported network name: {}'.format(cfg['name']))
@@ -86,9 +86,11 @@ class RetinaFace(nn.Module):
             ]
         fpn_num = len(in_channels_list)
         anchor_num_list = cfg.get('anchor_num_list', [2] * fpn_num)
+        ssh_type = cfg.get('ssh_type', 'ssh')
         out_channels = cfg['out_channel']
         self.fpn = FPN(in_channels_list,out_channels)
-        self.ssh = nn.ModuleList([SSH(out_channels, out_channels) for _ in range(fpn_num)])
+        # 根据配置选择原始 SSH 或 SSH+SE，便于后续做严格消融。
+        self.ssh = nn.ModuleList([build_ssh(ssh_type, out_channels, out_channels) for _ in range(fpn_num)])
 
         self.ClassHead = self._make_class_head(fpn_num=fpn_num, inchannels=cfg['out_channel'], anchor_num_list=anchor_num_list)
         self.BboxHead = self._make_bbox_head(fpn_num=fpn_num, inchannels=cfg['out_channel'], anchor_num_list=anchor_num_list)

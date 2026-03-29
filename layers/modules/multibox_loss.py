@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import ceil
-from utils.box_utils import atss_match, ciou_loss, decode, match
+from utils.box_utils import atss_match, ciou_loss, decode, log_sum_exp, match
 
 class MultiBoxLoss(nn.Module):
     """SSD Weighted Loss Function
@@ -28,7 +28,7 @@ class MultiBoxLoss(nn.Module):
         See: https://arxiv.org/pdf/1512.02325.pdf for more details.
     """
 
-    def __init__(self, num_classes, overlap_thresh, prior_for_matching, bkg_label, neg_mining, neg_pos, neg_overlap, encode_target, cfg=None, use_atss=True, atss_topk=9, focal_alpha=0.25, focal_gamma=2.0):
+    def __init__(self, num_classes, overlap_thresh, prior_for_matching, bkg_label, neg_mining, neg_pos, neg_overlap, encode_target, cfg=None, use_atss=False, atss_topk=9, focal_alpha=0.25, focal_gamma=2.0):
         super(MultiBoxLoss, self).__init__()
         self.num_classes = num_classes
         self.threshold = overlap_thresh
@@ -117,26 +117,57 @@ class MultiBoxLoss(nn.Module):
 
 
         pos = conf_t != zeros
-        conf_target = conf_t.clone()
-        # RetinaFace 当前是单类别检测，正样本统一映射到前景类别 1。
-        conf_target[pos] = 1
-
-        # Localization Loss (CIoU)
-        # Shape: [batch,num_priors,4]
         num_pos = pos.long().sum(1, keepdim=True)
-        pos_idx = pos.unsqueeze(pos.dim()).expand_as(loc_data)
-        loc_p = loc_data[pos_idx].view(-1, 4)
-        matched_priors = priors.unsqueeze(0).expand(num, num_priors, 4)[pos_idx].view(-1, 4)
-        matched_boxes = bbox_t[pos_idx].view(-1, 4)
-        if loc_p.numel() == 0:
-            loss_l = loc_data.sum() * 0
-        else:
-            # 先将预测偏移量解码回真实框，再与 GT 框计算 CIoU 损失。
-            decoded_boxes = decode(loc_p, matched_priors, self.variance)
-            loss_l = ciou_loss(decoded_boxes, matched_boxes, reduction='sum')
 
-        # Confidence Loss (Focal Loss)
-        loss_c = self.focal_loss(conf_data, conf_target)
+        if self.use_atss:
+            conf_target = conf_t.clone()
+            # RetinaFace 当前是单类别检测，正样本统一映射到前景类别 1。
+            conf_target[pos] = 1
+
+            # 使用 ATSS 时，回归分支切换为 CIoU Loss。
+            pos_idx = pos.unsqueeze(pos.dim()).expand_as(loc_data)
+            loc_p = loc_data[pos_idx].view(-1, 4)
+            matched_priors = priors.unsqueeze(0).expand(num, num_priors, 4)[pos_idx].view(-1, 4)
+            matched_boxes = bbox_t[pos_idx].view(-1, 4)
+            if loc_p.numel() == 0:
+                loss_l = loc_data.sum() * 0
+            else:
+                # 先将预测偏移量解码回真实框，再与 GT 框计算 CIoU 损失。
+                decoded_boxes = decode(loc_p, matched_priors, self.variance)
+                loss_l = ciou_loss(decoded_boxes, matched_boxes, reduction='sum')
+
+            # 使用 ATSS 时，分类分支同步切换为 Focal Loss。
+            loss_c = self.focal_loss(conf_data, conf_target)
+        else:
+            # 关闭 ATSS 时，恢复原始 RetinaFace 的 SmoothL1 边框回归损失。
+            pos_idx = pos.unsqueeze(pos.dim()).expand_as(loc_data)
+            loc_p = loc_data[pos_idx].view(-1, 4)
+            loc_t_pos = loc_t[pos_idx].view(-1, 4)
+            if loc_p.numel() == 0:
+                loss_l = loc_data.sum() * 0
+            else:
+                loss_l = F.smooth_l1_loss(loc_p, loc_t_pos, reduction='sum')
+
+            # 关闭 ATSS 时，恢复原始的 CrossEntropy + Hard Negative Mining。
+            batch_conf = conf_data.view(-1, self.num_classes)
+            loss_c = log_sum_exp(batch_conf) - batch_conf.gather(1, conf_t.view(-1, 1))
+
+            loss_c = loss_c.view(num, -1)
+            loss_c[pos] = 0
+            _, loss_idx = loss_c.sort(1, descending=True)
+            _, idx_rank = loss_idx.sort(1)
+            num_pos_for_neg = pos.long().sum(1, keepdim=True)
+            num_neg = torch.clamp(self.negpos_ratio * num_pos_for_neg, max=pos.size(1) - 1)
+            neg = idx_rank < num_neg.expand_as(idx_rank)
+
+            pos_idx = pos.unsqueeze(2).expand_as(conf_data)
+            neg_idx = neg.unsqueeze(2).expand_as(conf_data)
+            conf_p = conf_data[(pos_idx + neg_idx).gt(0)].view(-1, self.num_classes)
+            targets_weighted = conf_t[(pos + neg).gt(0)]
+            if conf_p.numel() == 0:
+                loss_c = conf_data.sum() * 0
+            else:
+                loss_c = F.cross_entropy(conf_p, targets_weighted, reduction='sum')
 
         # Sum of losses: L(x,c,l,g) = (Lconf(x, c) + αLloc(x,l,g)) / N
         N = max(num_pos.data.sum().float(), 1)

@@ -4,7 +4,7 @@ import argparse
 import torch
 import torch.backends.cudnn as cudnn
 import numpy as np
-from data import cfg_mnet, cfg_re50, cfg_resnest50, cfg_re50_p2, cfg_resnest50_p2
+from data import cfg_mnet, cfg_re50, cfg_resnest50, cfg_re50_p2, cfg_resnest50_p2, cfg_re50_p2_se, cfg_resnest50_p2_se
 from layers.functions.prior_box import PriorBox
 from utils.nms.py_cpu_nms import py_cpu_nms
 import cv2
@@ -16,7 +16,7 @@ from utils.timer import Timer
 parser = argparse.ArgumentParser(description='Retinaface')
 parser.add_argument('-m', '--trained_model', default='./weights/Resnet50_Final.pth',
                     type=str, help='Trained state_dict file path to open')
-parser.add_argument('--network', default='resnet50', help='Backbone network mobile0.25, resnet50, resnest50, resnet50_p2 or resnest50_p2')
+parser.add_argument('--network', default='resnet50', help='Backbone network mobile0.25, resnet50, resnest50, resnet50_p2, resnest50_p2, resnet50_p2_se or resnest50_p2_se')
 parser.add_argument('--origin_size', default=True, type=str, help='Whether use origin image size to evaluate')
 parser.add_argument('--save_folder', default='./widerface_evaluate/widerface_txt/', type=str, help='Dir to save txt results')
 parser.add_argument('--cpu', action="store_true", default=False, help='Use cpu inference')
@@ -80,6 +80,10 @@ if __name__ == '__main__':
         cfg = cfg_re50_p2
     elif args.network == "resnest50_p2":
         cfg = cfg_resnest50_p2
+    elif args.network == "resnet50_p2_se":
+        cfg = cfg_re50_p2_se
+    elif args.network == "resnest50_p2_se":
+        cfg = cfg_resnest50_p2_se
     else:
         raise ValueError("Unsupported network: {}".format(args.network))
     # net and model
