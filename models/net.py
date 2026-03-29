@@ -71,6 +71,7 @@ class FPN(nn.Module):
         leaky = 0
         if (out_channels <= 64):
             leaky = 0.1
+        self.use_p2 = len(in_channels_list) == 4
         self.output_convs = nn.ModuleList([
             conv_bn1X1(in_channels, out_channels, stride = 1, leaky = leaky)
             for in_channels in in_channels_list
@@ -79,17 +80,24 @@ class FPN(nn.Module):
             conv_bn(out_channels, out_channels, leaky = leaky)
             for _ in range(len(in_channels_list) - 1)
         ])
+        if self.use_p2:
+            self.p2_refine = conv_bn(out_channels, out_channels, leaky = leaky)
 
     def forward(self, input):
         # names = list(input.keys())
         input = list(input.values())
 
+        # Support both the original 3-level pyramid and the P2-P5 4-level pyramid.
         outputs = [conv(feature) for conv, feature in zip(self.output_convs, input)]
 
         for idx in range(len(outputs) - 1, 0, -1):
             upsample = F.interpolate(outputs[idx], size=[outputs[idx - 1].size(2), outputs[idx - 1].size(3)], mode="nearest")
             outputs[idx - 1] = outputs[idx - 1] + upsample
             outputs[idx - 1] = self.merge_convs[idx - 1](outputs[idx - 1])
+
+        # Add one extra conv on P2 to strengthen the smallest-face feature map.
+        if self.use_p2:
+            outputs[0] = self.p2_refine(outputs[0])
 
         return outputs
 
