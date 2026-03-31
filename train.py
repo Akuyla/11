@@ -5,7 +5,7 @@ import torch.optim as optim
 import torch.backends.cudnn as cudnn
 import argparse
 import torch.utils.data as data
-from data import WiderFaceDetection, detection_collate, preproc, cfg_mnet, cfg_re50, cfg_resnest50, cfg_re50_p2, cfg_resnest50_p2, cfg_re50_p2_se, cfg_resnest50_p2_se
+from data import WiderFaceDetection, detection_collate, preproc, cfg_mnet, cfg_re50, cfg_resnest50, cfg_resnest50_atss, cfg_re50_p2, cfg_resnest50_p2, cfg_re50_p2_se, cfg_resnest50_p2_se, cfg_resnest50_p2_atss_se, cfg_resnest50_p2_atss_se_softnms
 from layers.modules import MultiBoxLoss
 from layers.functions.prior_box import PriorBox
 import time
@@ -15,7 +15,7 @@ from models.retinaface import RetinaFace
 
 parser = argparse.ArgumentParser(description='Retinaface Training')
 parser.add_argument('--training_dataset', default='D:\\cut\\retinaface_dataset\\train\\label.txt', help='Training dataset directory')
-parser.add_argument('--network', default='resnest50_p2_se', help='Backbone network mobile0.25, resnet50, resnest50, resnet50_p2, resnest50_p2, resnet50_p2_se or resnest50_p2_se')
+parser.add_argument('--network', default='resnest50_p2_se', help='Backbone network mobile0.25, resnet50, resnest50, resnest50_atss, resnet50_p2, resnest50_p2, resnet50_p2_se, resnest50_p2_se, resnest50_p2_atss_se or resnest50_p2_atss_se_softnms')
 parser.add_argument('--num_workers', default=4, type=int, help='Number of workers used in dataloading')
 parser.add_argument('--lr', '--learning-rate', default=1e-3, type=float, help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
@@ -24,6 +24,7 @@ parser.add_argument('--resume_epoch', default=0, type=int, help='resume iter for
 parser.add_argument('--weight_decay', default=5e-4, type=float, help='Weight decay for SGD')
 parser.add_argument('--gamma', default=0.1, type=float, help='Gamma update for SGD')
 parser.add_argument('--save_folder', default='./weights/', help='Location to save checkpoint models')
+parser.add_argument('--disable_landmark_loss', action='store_true', default=False, help='Disable landmark loss for bbox-only datasets')
 
 args = parser.parse_args()
 
@@ -36,6 +37,8 @@ elif args.network == "resnet50":
     cfg = cfg_re50
 elif args.network == "resnest50":
     cfg = cfg_resnest50
+elif args.network == "resnest50_atss":
+    cfg = cfg_resnest50_atss
 elif args.network == "resnet50_p2":
     cfg = cfg_re50_p2
 elif args.network == "resnest50_p2":
@@ -44,6 +47,10 @@ elif args.network == "resnet50_p2_se":
     cfg = cfg_re50_p2_se
 elif args.network == "resnest50_p2_se":
     cfg = cfg_resnest50_p2_se
+elif args.network == "resnest50_p2_atss_se":
+    cfg = cfg_resnest50_p2_atss_se
+elif args.network == "resnest50_p2_atss_se_softnms":
+    cfg = cfg_resnest50_p2_atss_se_softnms
 else:
     raise ValueError("Unsupported network: {}".format(args.network))
 
@@ -92,7 +99,20 @@ cudnn.benchmark = True
 
 optimizer = optim.SGD(net.parameters(), lr=initial_lr, momentum=momentum, weight_decay=weight_decay)
 # 用一个总开关统一控制 ATSS 及其配套的 Focal Loss、CIoU Loss，便于后续做整体消融。
-criterion = MultiBoxLoss(num_classes, 0.35, True, 0, True, 7, 0.35, False, cfg=cfg, use_atss=cfg.get('use_atss', False))
+# 对自建 bbox-only 数据集，可通过命令行关闭 landmark loss，避免无关键点监督干扰检测训练。
+criterion = MultiBoxLoss(
+    num_classes,
+    0.35,
+    True,
+    0,
+    True,
+    7,
+    0.35,
+    False,
+    cfg=cfg,
+    use_atss=cfg.get('use_atss', False),
+    use_landmark=(not args.disable_landmark_loss),
+)
 
 priorbox = PriorBox(cfg, image_size=(img_dim, img_dim))
 with torch.no_grad():

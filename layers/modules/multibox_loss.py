@@ -28,7 +28,7 @@ class MultiBoxLoss(nn.Module):
         See: https://arxiv.org/pdf/1512.02325.pdf for more details.
     """
 
-    def __init__(self, num_classes, overlap_thresh, prior_for_matching, bkg_label, neg_mining, neg_pos, neg_overlap, encode_target, cfg=None, use_atss=False, atss_topk=9, focal_alpha=0.25, focal_gamma=2.0):
+    def __init__(self, num_classes, overlap_thresh, prior_for_matching, bkg_label, neg_mining, neg_pos, neg_overlap, encode_target, cfg=None, use_atss=False, atss_topk=9, focal_alpha=0.25, focal_gamma=2.0, use_landmark=True):
         super(MultiBoxLoss, self).__init__()
         self.num_classes = num_classes
         self.threshold = overlap_thresh
@@ -44,6 +44,7 @@ class MultiBoxLoss(nn.Module):
         self.atss_topk = atss_topk
         self.focal_alpha = focal_alpha
         self.focal_gamma = focal_gamma
+        self.use_landmark = use_landmark
         self.num_priors_per_level = None
         if cfg is not None:
             # 根据当前输入尺寸和每层 anchor 设置，预先计算各层 prior 数量，供 ATSS 分层采样使用。
@@ -105,15 +106,19 @@ class MultiBoxLoss(nn.Module):
                 match(self.threshold, truths, defaults, self.variance, labels, landms, loc_t, conf_t, landm_t, bbox_t, idx)
 
         zeros = torch.tensor(0, device=device)
-        # landm Loss (Smooth L1)
-        # Shape: [batch,num_priors,10]
-        pos1 = conf_t > zeros
-        num_pos_landm = pos1.long().sum(1, keepdim=True)
-        N1 = max(num_pos_landm.data.sum().float(), 1)
-        pos_idx1 = pos1.unsqueeze(pos1.dim()).expand_as(landm_data)
-        landm_p = landm_data[pos_idx1].view(-1, 10)
-        landm_t = landm_t[pos_idx1].view(-1, 10)
-        loss_landm = F.smooth_l1_loss(landm_p, landm_t, reduction='sum')
+        if self.use_landmark:
+            # 保留原始 landmark 分支训练逻辑，适用于带五点标注的数据集。
+            pos1 = conf_t > zeros
+            num_pos_landm = pos1.long().sum(1, keepdim=True)
+            N1 = max(num_pos_landm.data.sum().float(), 1)
+            pos_idx1 = pos1.unsqueeze(pos1.dim()).expand_as(landm_data)
+            landm_p = landm_data[pos_idx1].view(-1, 10)
+            landm_t = landm_t[pos_idx1].view(-1, 10)
+            loss_landm = F.smooth_l1_loss(landm_p, landm_t, reduction='sum')
+        else:
+            # 自建 bbox-only 数据集没有关键点监督时，显式关闭 landmark loss。
+            N1 = 1
+            loss_landm = landm_data.sum() * 0
 
 
         pos = conf_t != zeros

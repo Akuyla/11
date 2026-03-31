@@ -69,7 +69,7 @@ class RetinaFace(nn.Module):
         elif cfg['name'] in ['Resnet50', 'Resnet50_P2', 'Resnet50_P2_SE']:
             import torchvision.models as models
             backbone = models.resnet50(pretrained=cfg['pretrain'])
-        elif cfg['name'] in ['ResNeSt50', 'ResNeSt50_P2', 'ResNeSt50_P2_SE']:
+        elif cfg['name'] in ['ResNeSt50', 'ResNeSt50_ATSS', 'ResNeSt50_P2', 'ResNeSt50_P2_SE', 'ResNeSt50_P2_ATSS_SE', 'ResNeSt50_P2_ATSS_SE_SoftNMS']:
             backbone = build_resnest50(pretrained=cfg['pretrain'])
         else:
             raise ValueError('Unsupported network name: {}'.format(cfg['name']))
